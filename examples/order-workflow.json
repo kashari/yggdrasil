@@ -1,0 +1,108 @@
+[
+  {
+    "id": "order-process",
+    "initialState": "pending",
+    "states": [
+      {
+        "stateId": "pending",
+        "isEndState": false,
+        "entryActions": [],
+        "exitActions": []
+      },
+      {
+        "stateId": "paid",
+        "isEndState": false,
+        "entryActions": [
+          {
+            "type": "HTTP",
+            "method": "POST",
+            "url": "https://api.example.com/orders/{orderId}/confirm",
+            "body": "{\"status\": \"payment_confirmed\"}"
+          }
+        ],
+        "exitActions": []
+      },
+      {
+        "stateId": "processing",
+        "isEndState": false,
+        "entryActions": [
+          {
+            "type": "START_CHILD",
+            "productId": "fulfillment-subprocess",
+            "delegate": true
+          }
+        ],
+        "exitActions": []
+      },
+      {
+        "stateId": "shipped",
+        "isEndState": false,
+        "entryActions": [
+          {
+            "type": "HTTP",
+            "method": "POST",
+            "url": "https://api.example.com/notifications/send",
+            "body": "{\"orderId\": \"{orderId}\", \"message\": \"Your order has been shipped\"}"
+          }
+        ],
+        "exitActions": []
+      },
+      {
+        "stateId": "delivered",
+        "isEndState": true,
+        "entryActions": [],
+        "exitActions": []
+      },
+      {
+        "stateId": "cancelled",
+        "isEndState": true,
+        "entryActions": [
+          {
+            "type": "HTTP",
+            "method": "POST",
+            "url": "https://api.example.com/orders/{orderId}/refund",
+            "body": "{}"
+          }
+        ],
+        "exitActions": []
+      }
+    ],
+    "transitions": [
+      {
+        "source": "pending",
+        "target": "paid",
+        "event": "PAYMENT_RECEIVED",
+        "isCommon": false,
+        "actions": []
+      },
+      {
+        "source": "paid",
+        "target": "processing",
+        "event": "START_FULFILLMENT",
+        "isCommon": false,
+        "actions": []
+      },
+      {
+        "source": "processing",
+        "target": "shipped",
+        "event": "CHILD_COMPLETED",
+        "isCommon": false,
+        "actions": []
+      },
+      {
+        "source": "shipped",
+        "target": "delivered",
+        "event": "DELIVERY_CONFIRMED",
+        "isCommon": false,
+        "actions": []
+      },
+      {
+        "source": "*",
+        "target": "cancelled",
+        "event": "CANCEL_ORDER",
+        "isCommon": true,
+        "actions": []
+      }
+    ]
+  }
+]
