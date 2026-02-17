@@ -1,0 +1,83 @@
+[
+  {
+    "id": "document-approval",
+    "initialState": "draft",
+    "states": [
+      {
+        "stateId": "draft",
+        "isEndState": false,
+        "entryActions": [],
+        "exitActions": []
+      },
+      {
+        "stateId": "pending_review",
+        "isEndState": false,
+        "entryActions": [
+          {
+            "type": "HTTP",
+            "method": "POST",
+            "url": "https://api.example.com/notifications/reviewer",
+            "body": "{\"documentId\": \"{documentId}\", \"reviewerEmail\": \"{reviewerEmail}\"}"
+          }
+        ],
+        "exitActions": []
+      },
+      {
+        "stateId": "approved",
+        "isEndState": true,
+        "entryActions": [
+          {
+            "type": "HTTP",
+            "method": "POST",
+            "url": "https://api.example.com/documents/{documentId}/publish",
+            "body": "{}"
+          }
+        ],
+        "exitActions": []
+      },
+      {
+        "stateId": "rejected",
+        "isEndState": false,
+        "entryActions": [
+          {
+            "type": "HTTP",
+            "method": "POST",
+            "url": "https://api.example.com/notifications/author",
+            "body": "{\"documentId\": \"{documentId}\", \"reason\": \"{rejectionReason}\"}"
+          }
+        ],
+        "exitActions": []
+      }
+    ],
+    "transitions": [
+      {
+        "source": "draft",
+        "target": "pending_review",
+        "event": "SUBMIT",
+        "isCommon": false,
+        "actions": []
+      },
+      {
+        "source": "pending_review",
+        "target": "approved",
+        "event": "APPROVE",
+        "isCommon": false,
+        "actions": []
+      },
+      {
+        "source": "pending_review",
+        "target": "rejected",
+        "event": "REJECT",
+        "isCommon": false,
+        "actions": []
+      },
+      {
+        "source": "rejected",
+        "target": "draft",
+        "event": "REVISE",
+        "isCommon": false,
+        "actions": []
+      }
+    ]
+  }
+]
