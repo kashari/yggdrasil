@@ -67,6 +67,7 @@ type WorkflowInstance struct {
 	UpdatedAt time.Time
 	DeletedAt gorm.DeletedAt `gorm:"index"`
 
+	Name          string     `gorm:"uniqueIndex"`
 	WorkflowDefID string
 	CurrentState  string
 	Status        string

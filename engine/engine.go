@@ -15,6 +15,10 @@ import (
 	"gorm.io/gorm"
 )
 
+// HTTPTimeout controls the timeout used for HTTP actions. Set by the yggdrasil
+// package from Config.HTTPTimeout at initialisation time.
+var HTTPTimeout = 5 * time.Second
+
 var Machines sync.Map
 
 type Event struct {
@@ -33,8 +37,9 @@ type Machine struct {
 }
 
 func Spawn(db *gorm.DB, instanceID uuid.UUID) *Machine {
-	if m, loaded := Machines.Load(instanceID); loaded {
-		return m.(*Machine)
+	// Fast path: machine already running.
+	if existing, ok := Machines.Load(instanceID); ok {
+		return existing.(*Machine)
 	}
 
 	var inst model.WorkflowInstance
@@ -56,7 +61,12 @@ func Spawn(db *gorm.DB, instanceID uuid.UUID) *Machine {
 		stop:     make(chan struct{}),
 	}
 
-	Machines.Store(instanceID, m)
+	// LoadOrStore ensures only one Machine wins when two goroutines race here.
+	actual, loaded := Machines.LoadOrStore(instanceID, m)
+	if loaded {
+		return actual.(*Machine)
+	}
+
 	go m.Loop()
 	return m
 }
@@ -64,7 +74,7 @@ func Spawn(db *gorm.DB, instanceID uuid.UUID) *Machine {
 func (m *Machine) Loop() {
 	defer func() {
 		Machines.Delete(m.Instance.ID)
-		log.Printf("Machine %s stopped", m.Instance.ID)
+		log.Printf("machine %s (%s) stopped", m.Instance.Name, m.Instance.ID)
 	}()
 
 	for {
@@ -92,17 +102,16 @@ func (m *Machine) processEvent(evt Event) bool {
 	if m.Instance.Status == model.StatusWaiting {
 		isChildCallback := strings.HasPrefix(evt.Name, "CHILD_") || strings.HasPrefix(evt.Name, "SYS_")
 		if !isChildCallback {
-			log.Printf("Ignored event %s: Parent is waiting for child", evt.Name)
+			log.Printf("ignored event %s on machine %s: waiting for child", evt.Name, m.Instance.ID)
 			return false
 		}
 	}
 
 	var selectedT *model.TransitionDefinition
-
-	for _, t := range m.Def.Transitions {
+	for i, t := range m.Def.Transitions {
 		matchSource := (t.Source == m.Instance.CurrentState) || (t.IsCommon && t.Source == "*")
 		if matchSource && t.Event == evt.Name {
-			selectedT = &t
+			selectedT = &m.Def.Transitions[i]
 			break
 		}
 	}
@@ -130,7 +139,6 @@ func (m *Machine) processEvent(evt Event) bool {
 				m.Instance.Status = model.StatusCompleted
 				isEnd = true
 			}
-			// E. Entry Actions
 			for _, a := range s.EntryActions {
 				m.runAction(a)
 			}
@@ -182,16 +190,16 @@ func (m *Machine) execStartChild(a model.ActionDefinition) {
 	}
 
 	if err := m.DB.Create(&childInst).Error; err != nil {
-		log.Printf("Failed to create child: %v", err)
+		log.Printf("failed to create child machine: %v", err)
 		return
 	}
 
 	Spawn(m.DB, childInst.ID)
-	log.Printf("Parent %s started child %s", m.Instance.ID, childInst.ID)
+	log.Printf("machine %s started child %s", m.Instance.ID, childInst.ID)
 
 	if a.Delegate {
 		m.Instance.Status = model.StatusWaiting
-		log.Printf("Parent %s is now WAITING for child", m.Instance.ID)
+		log.Printf("machine %s is now waiting for child", m.Instance.ID)
 	}
 }
 
@@ -200,12 +208,11 @@ func (m *Machine) notifyParent(parentID uuid.UUID) {
 	if parent == nil {
 		return
 	}
-	event := "CHILD_COMPLETED"
 
 	ack := make(chan bool)
-	parent.inbox <- Event{Name: event, Ack: ack}
+	parent.inbox <- Event{Name: "CHILD_COMPLETED", Ack: ack}
 	<-ack
-	log.Printf("Child %s notified Parent %s", m.Instance.ID, parentID)
+	log.Printf("child %s notified parent %s", m.Instance.ID, parentID)
 }
 
 func (m *Machine) execHttp(a model.ActionDefinition) {
@@ -217,16 +224,25 @@ func (m *Machine) execHttp(a model.ActionDefinition) {
 		url = strings.ReplaceAll(url, fmt.Sprintf("{%s}", k), fmt.Sprintf("%v", v))
 	}
 
-	req, _ := http.NewRequest(a.Method, url, bytes.NewBufferString(a.Body))
-	client := &http.Client{Timeout: 5 * time.Second}
-	client.Do(req)
+	req, err := http.NewRequest(a.Method, url, bytes.NewBufferString(a.Body))
+	if err != nil {
+		log.Printf("http action: failed to build request to %s: %v", url, err)
+		return
+	}
+
+	client := &http.Client{Timeout: HTTPTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("http action: request to %s failed: %v", url, err)
+		return
+	}
+	resp.Body.Close()
 }
 
 func (m *Machine) Inbox() chan<- Event {
 	return m.inbox
 }
 
-// Stop returns the stop channel for graceful shutdown
 func (m *Machine) Stop() chan<- struct{} {
 	return m.stop
 }
