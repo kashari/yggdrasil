@@ -15,8 +15,6 @@ import (
 	"gorm.io/gorm"
 )
 
-// HTTPTimeout controls the timeout used for HTTP actions. Set by the yggdrasil
-// package from Config.HTTPTimeout at initialisation time.
 var HTTPTimeout = 5 * time.Second
 
 var Machines sync.Map
@@ -37,7 +35,6 @@ type Machine struct {
 }
 
 func Spawn(db *gorm.DB, instanceID uuid.UUID) *Machine {
-	// Fast path: machine already running.
 	if existing, ok := Machines.Load(instanceID); ok {
 		return existing.(*Machine)
 	}
@@ -61,7 +58,6 @@ func Spawn(db *gorm.DB, instanceID uuid.UUID) *Machine {
 		stop:     make(chan struct{}),
 	}
 
-	// LoadOrStore ensures only one Machine wins when two goroutines race here.
 	actual, loaded := Machines.LoadOrStore(instanceID, m)
 	if loaded {
 		return actual.(*Machine)
@@ -100,6 +96,24 @@ func (m *Machine) Loop() {
 }
 
 func (m *Machine) processEvent(evt Event) bool {
+	if evt.Name == "_CHILD_DONE_TICK" {
+		if m.Instance.PendingChildren > 0 {
+			m.Instance.PendingChildren--
+		}
+		if m.Instance.PendingChildren == 0 {
+			completionEvent, _ := evt.Payload["_completionEvent"].(string)
+			if completionEvent == "" {
+				completionEvent = "CHILD_COMPLETED"
+			}
+
+			realEvt := Event{Name: completionEvent, Payload: evt.Payload}
+			return m.processEvent(realEvt)
+		}
+
+		golog.Info("machine {} still waiting for {} child(ren)", m.Instance.ID, m.Instance.PendingChildren)
+		return true
+	}
+
 	if m.Instance.Status == model.StatusWaiting {
 		isChildCallback := strings.HasPrefix(evt.Name, "CHILD_") || strings.HasPrefix(evt.Name, "SYS_")
 		if !isChildCallback {
@@ -127,6 +141,7 @@ func (m *Machine) processEvent(evt Event) bool {
 		m.runAction(a)
 	}
 
+	fromState := m.Instance.CurrentState
 	m.Instance.CurrentState = selectedT.Target
 
 	if m.Instance.Status == model.StatusWaiting {
@@ -138,6 +153,7 @@ func (m *Machine) processEvent(evt Event) bool {
 		if s.StateID == selectedT.Target {
 			if s.IsEndState {
 				m.Instance.Status = model.StatusCompleted
+				m.Instance.TerminalState = s.StateID
 				isEnd = true
 			}
 			for _, a := range s.EntryActions {
@@ -149,6 +165,20 @@ func (m *Machine) processEvent(evt Event) bool {
 	if isEnd && m.Instance.ParentInstanceID != nil {
 		go m.notifyParent(*m.Instance.ParentInstanceID)
 	}
+	var payloadJSON []byte
+	if evt.Payload != nil {
+		payloadJSON, _ = json.Marshal(evt.Payload)
+	}
+	m.DB.Create(&model.TransitionHistory{
+		OccurredAt:    time.Now(),
+		InstanceID:    m.Instance.ID,
+		InstanceName:  m.Instance.Name,
+		WorkflowDefID: m.Instance.WorkflowDefID,
+		FromState:     fromState,
+		Event:         evt.Name,
+		ToState:       selectedT.Target,
+		Payload:       payloadJSON,
+	})
 
 	return true
 }
@@ -199,8 +229,9 @@ func (m *Machine) execStartChild(a model.ActionDefinition) {
 	golog.Info("machine {} started child {}", m.Instance.ID, childInst.ID)
 
 	if a.Delegate {
+		m.Instance.PendingChildren++
 		m.Instance.Status = model.StatusWaiting
-		golog.Info("machine {} is now waiting for child", m.Instance.ID)
+		golog.Info("machine {} is now waiting for child (pending={})", m.Instance.ID, m.Instance.PendingChildren)
 	}
 }
 
@@ -210,10 +241,47 @@ func (m *Machine) notifyParent(parentID uuid.UUID) {
 		return
 	}
 
+	var parentVars, childVars map[string]any
+	json.Unmarshal(parent.Instance.Variables, &parentVars)
+	json.Unmarshal(m.Instance.Variables, &childVars)
+	if parentVars == nil {
+		parentVars = make(map[string]any)
+	}
+	for k, v := range childVars {
+		parentVars[k] = v
+	}
+	if merged, err := json.Marshal(parentVars); err == nil {
+		parent.Instance.Variables = merged
+	}
+
+	eventName := "CHILD_" + m.Instance.TerminalState
+	for _, t := range parent.Def.Transitions {
+		for _, a := range t.Actions {
+			if a.Type == model.ActionTypeStartChild && a.ProductId == m.Instance.WorkflowDefID && a.CompletionEvent != "" {
+				eventName = a.CompletionEvent
+				break
+			}
+		}
+	}
+
+	if eventName == "CHILD_"+m.Instance.TerminalState {
+		for _, s := range parent.Def.States {
+			for _, a := range s.EntryActions {
+				if a.Type == model.ActionTypeStartChild && a.ProductId == m.Instance.WorkflowDefID && a.CompletionEvent != "" {
+					eventName = a.CompletionEvent
+				}
+			}
+		}
+	}
+
 	ack := make(chan bool)
-	parent.inbox <- Event{Name: "CHILD_COMPLETED", Ack: ack}
+	parent.inbox <- Event{
+		Name:    "_CHILD_DONE_TICK",
+		Payload: map[string]any{"_completionEvent": eventName},
+		Ack:     ack,
+	}
 	<-ack
-	golog.Info("child {} notified parent {}", m.Instance.ID, parentID)
+	golog.Info("child {} notified parent {} (event={})", m.Instance.ID, parentID, eventName)
 }
 
 func (m *Machine) execHttp(a model.ActionDefinition) {
