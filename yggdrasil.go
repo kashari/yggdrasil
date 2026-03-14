@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/kashari/draupnir"
 	"github.com/kashari/golog"
+	"github.com/kashari/yggdrasil/analyzer"
 	"github.com/kashari/yggdrasil/engine"
 	"github.com/kashari/yggdrasil/model"
 	"gorm.io/datatypes"
@@ -86,6 +87,7 @@ func (y *Yggdrasil) AutoMigrate() error {
 		&model.TransitionDefinition{},
 		&model.ActionDefinition{},
 		&model.WorkflowInstance{},
+		&model.TransitionHistory{},
 	)
 }
 
@@ -294,7 +296,10 @@ func (y *Yggdrasil) AvailableEvents(id string) ([]string, error) {
 	return events, nil
 }
 
-// resolveID parses id as a UUID, falling back to a name lookup in the DB.
+func (y *Yggdrasil) ResolveID(id string) (uuid.UUID, error) {
+	return y.resolveID(id)
+}
+
 func (y *Yggdrasil) resolveID(id string) (uuid.UUID, error) {
 	if uid, err := uuid.Parse(id); err == nil {
 		return uid, nil
@@ -321,6 +326,14 @@ func (y *Yggdrasil) Draupnir() *draupnir.Router {
 	router.POST("/machines/:id/stop", y.handleStopMachine)
 	router.POST("/machines/:id/resume", y.handleResume)
 	router.GET("/machines/:id/events", y.handleAvailableEvents)
+
+	ah := &analyzer.Handler{
+		DB:        y.db,
+		Blueprint: y.Blueprint,
+		ResolveID: y.ResolveID,
+		Inspect:   y.Inspect,
+	}
+	ah.Register(router)
 
 	return router
 }
@@ -411,10 +424,6 @@ func (y *Yggdrasil) handleFind(ctx *draupnir.Context) {
 	ctx.JSON(http.StatusOK, machines)
 }
 
-// handleFire reads the machine id from the path, the event name from ?event=,
-// and any additional query params as the event payload.
-//
-//	POST /machines/order-42/event?event=PAYMENT_RECEIVED&amount=99.99
 func (y *Yggdrasil) handleFire(ctx *draupnir.Context) {
 	id := ctx.Param("id")
 	q := ctx.Query("event")
@@ -426,7 +435,6 @@ func (y *Yggdrasil) handleFire(ctx *draupnir.Context) {
 
 	queryParams := ctx.Request.URL.Query()
 
-	// Every query param except "event" becomes payload data.
 	var payload map[string]any
 	for k, vals := range queryParams {
 		if k == "event" {

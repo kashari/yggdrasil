@@ -67,14 +67,15 @@ type WorkflowInstance struct {
 	UpdatedAt time.Time
 	DeletedAt gorm.DeletedAt `gorm:"index"`
 
-	Name          string     `gorm:"uniqueIndex"`
+	Name          string `gorm:"uniqueIndex"`
 	WorkflowDefID string
 	CurrentState  string
 	Status        string
 
 	ParentInstanceID *uuid.UUID `gorm:"type:uuid;index"`
-
-	Variables datatypes.JSON
+	TerminalState    string
+	PendingChildren  int
+	Variables        datatypes.JSON
 }
 
 func (w *WorkflowInstance) BeforeCreate(tx *gorm.DB) (err error) {
