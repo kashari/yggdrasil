@@ -3,12 +3,15 @@ package yggdrasil
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/kashari/draupnir"
+	"github.com/kashari/golog"
 	"github.com/kashari/yggdrasil/engine"
 	"github.com/kashari/yggdrasil/model"
 	"gorm.io/datatypes"
@@ -36,22 +39,18 @@ const (
 	ActionTypeStartChild = model.ActionTypeStartChild
 )
 
-// Default is the package-level singleton. Initialise it with Init.
 var Default *Yggdrasil
 
-// Config holds construction options for Yggdrasil.
 type Config struct {
 	DB          *gorm.DB
 	HTTPTimeout time.Duration
 }
 
-// Yggdrasil is the central engine handle.
 type Yggdrasil struct {
 	db *gorm.DB
 	mu sync.RWMutex
 }
 
-// Init creates the package-level Default instance from cfg.
 func Init(cfg Config) error {
 	y, err := New(cfg)
 	if err != nil {
@@ -108,8 +107,6 @@ func (y *Yggdrasil) Shutdown(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// ── Definitions ───────────────────────────────────────────────────────────────
-
 // Define saves one or more machine definitions in a single transaction.
 func Define(defs ...Definition) error { return Default.Define(defs...) }
 
@@ -137,12 +134,11 @@ func (y *Yggdrasil) Blueprint(id string) (*Definition, error) {
 	return &def, nil
 }
 
-// ── Machines ──────────────────────────────────────────────────────────────────
-
 // Launch starts a new machine from the given definition and returns it.
 // name is optional; when set, the machine is also addressable by name.
 // Package-level alias delegates to Default.
 func Launch(defID, name string, vars map[string]any) (*Machine, error) {
+	golog.Info("Launching machine from definition {} with name '{}'", defID, name)
 	return Default.Launch(defID, name, vars)
 }
 
@@ -170,6 +166,7 @@ func (y *Yggdrasil) Launch(defID, name string, vars map[string]any) (*Machine, e
 	}
 
 	engine.Spawn(y.db, m.ID)
+	golog.Info("Machine launched with ID {}", m.ID)
 	return &m, nil
 }
 
@@ -179,6 +176,7 @@ func (y *Yggdrasil) Launch(defID, name string, vars map[string]any) (*Machine, e
 func Fire(id, event string) (bool, error) { return Default.Fire(id, event) }
 
 func (y *Yggdrasil) Fire(id, event string) (bool, error) {
+	golog.Info("Sending event '{}' to machine '{}'", event, id)
 	return y.FireWith(id, event, nil)
 }
 
@@ -201,6 +199,7 @@ func (y *Yggdrasil) FireWith(id, event string, payload map[string]any) (bool, er
 
 	ack := make(chan bool)
 	m.Inbox() <- engine.Event{Name: event, Payload: payload, Ack: ack}
+	golog.Info("Event {} sent to machine '{}'", event, id)
 	return <-ack, nil
 }
 
@@ -242,6 +241,59 @@ func (y *Yggdrasil) Find(defID, status string, limit int) ([]Machine, error) {
 	return machines, nil
 }
 
+// Resume restarts a persisted machine that was stopped but is not in a terminal state.
+// If the machine is already running, this is a no-op and returns the current instance.
+func Resume(id string) (*Machine, error) { return Default.Resume(id) }
+
+func (y *Yggdrasil) Resume(id string) (*Machine, error) {
+	uid, err := y.resolveID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	var inst Machine
+	if err := y.db.First(&inst, "id = ?", uid).Error; err != nil {
+		return nil, ErrInstanceNotFound
+	}
+
+	if inst.Status == StatusCompleted || inst.Status == StatusFailed {
+		return nil, ErrMachineTerminated
+	}
+
+	// Already running — idempotent.
+	if _, running := engine.Machines.Load(uid); running {
+		return &inst, nil
+	}
+
+	engine.Spawn(y.db, uid)
+	golog.Info("Machine {} ({}) resumed", inst.Name, uid)
+	return &inst, nil
+}
+
+// AvailableEvents returns all valid events that can be sent to the machine from
+// its current state, formatted as "EVENT -> TARGET_STATE".
+func AvailableEvents(id string) ([]string, error) { return Default.AvailableEvents(id) }
+
+func (y *Yggdrasil) AvailableEvents(id string) ([]string, error) {
+	inst, err := y.Inspect(id)
+	if err != nil {
+		return nil, err
+	}
+
+	def, err := y.Blueprint(inst.WorkflowDefID)
+	if err != nil {
+		return nil, err
+	}
+
+	var events []string
+	for _, t := range def.Transitions {
+		if t.Source == inst.CurrentState || (t.IsCommon && t.Source == "*") {
+			events = append(events, fmt.Sprintf("%s -> %s", t.Event, t.Target))
+		}
+	}
+	return events, nil
+}
+
 // resolveID parses id as a UUID, falling back to a name lookup in the DB.
 func (y *Yggdrasil) resolveID(id string) (uuid.UUID, error) {
 	if uid, err := uuid.Parse(id); err == nil {
@@ -255,107 +307,128 @@ func (y *Yggdrasil) resolveID(id string) (uuid.UUID, error) {
 	return m.ID, nil
 }
 
-// ── HTTP routing ──────────────────────────────────────────────────────────────
+func (y *Yggdrasil) Draupnir() *draupnir.Router {
+	router := draupnir.New().
+		WithFileLogging(fmt.Sprintf("Workflow %s.log", time.Now().Format("Monday 1 January 2006"))).
+		WithRateLimiter(100, 5*time.Second).
+		WithWorkerPool(20)
 
-// Mount registers all Yggdrasil routes on mux using Go 1.22 method+path syntax.
-//
-//	POST /definitions
-//	POST /machines                        body: { definitionId, name?, variables? }
-//	GET  /machines                        ?definitionId= &status= &limit=
-//	GET  /machines/{id}                   id = UUID or name
-//	POST /machines/{id}/event?event=NAME  extra query params become payload
-func (y *Yggdrasil) Mount(mux *http.ServeMux) {
-	mux.HandleFunc("POST /definitions", y.handleDefine)
-	mux.HandleFunc("POST /machines", y.handleLaunch)
-	mux.HandleFunc("GET /machines", y.handleFind)
-	mux.HandleFunc("GET /machines/{id}", y.handleInspect)
-	mux.HandleFunc("POST /machines/{id}/event", y.handleFire)
+	router.POST("/definitions", y.handleDefine)
+	router.POST("/machines/start", y.handleLaunch)
+	router.GET("/machines", y.handleFind)
+	router.GET("/machines/:id", y.handleInspect)
+	router.POST("/machines/:id/event", y.handleFire)
+	router.POST("/machines/:id/stop", y.handleStopMachine)
+	router.POST("/machines/:id/resume", y.handleResume)
+	router.GET("/machines/:id/events", y.handleAvailableEvents)
+
+	return router
 }
 
-func (y *Yggdrasil) handleDefine(w http.ResponseWriter, r *http.Request) {
+func (y *Yggdrasil) handleStopMachine(ctx *draupnir.Context) {
+	id := ctx.Param("id")
+
+	uid, err := y.resolveID(id)
+	if err != nil {
+		ctx.JSON(http.StatusNotFound, map[string]string{"error": "machine not found"})
+		return
+	}
+
+	m := engine.Spawn(y.db, uid)
+	if m == nil {
+		ctx.JSON(http.StatusNotFound, map[string]string{"error": "machine not found"})
+		return
+	}
+
+	m.Stop() <- struct{}{}
+	ctx.JSON(http.StatusOK, map[string]string{"message": "Stop signal sent to machine."})
+}
+
+func (y *Yggdrasil) handleDefine(ctx *draupnir.Context) {
 	var defs []Definition
-	if err := json.NewDecoder(r.Body).Decode(&defs); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+
+	if err := ctx.BindJSON(&defs); err != nil {
+		ctx.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+
 	if err := y.Define(defs...); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		ctx.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	w.WriteHeader(http.StatusCreated)
+	ctx.JSON(http.StatusCreated, map[string]string{"status": "definitions saved"})
 }
 
-func (y *Yggdrasil) handleLaunch(w http.ResponseWriter, r *http.Request) {
+func (y *Yggdrasil) handleLaunch(ctx *draupnir.Context) {
 	var req struct {
 		DefinitionID string         `json:"definitionId"`
 		Name         string         `json:"name"`
 		Variables    map[string]any `json:"variables"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+
+	if err := ctx.BindJSON(&req); err != nil {
+		ctx.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
 	m, err := y.Launch(req.DefinitionID, req.Name, req.Variables)
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {
-			http.Error(w, "definition not found", http.StatusNotFound)
+			ctx.JSON(http.StatusNotFound, map[string]string{"error": "definition not found"})
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		ctx.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"id": m.ID.String(), "name": m.Name})
+	ctx.JSON(http.StatusCreated, map[string]string{"id": m.ID.String(), "name": m.Name})
 }
 
-func (y *Yggdrasil) handleInspect(w http.ResponseWriter, r *http.Request) {
-	m, err := y.Inspect(r.PathValue("id"))
+func (y *Yggdrasil) handleInspect(ctx *draupnir.Context) {
+	m, err := y.Inspect(ctx.Param("id"))
 	if err != nil {
 		if err == gorm.ErrRecordNotFound || err == ErrInstanceNotFound {
-			http.Error(w, "machine not found", http.StatusNotFound)
+			ctx.JSON(http.StatusNotFound, map[string]string{"error": "machine not found"})
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		ctx.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(m)
+	ctx.JSON(http.StatusOK, m)
 }
 
-func (y *Yggdrasil) handleFind(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	limit, _ := strconv.Atoi(q.Get("limit"))
+func (y *Yggdrasil) handleFind(ctx *draupnir.Context) {
+	q := ctx.Query("limit")
+	limit, _ := strconv.Atoi(q)
 
-	machines, err := y.Find(q.Get("definitionId"), q.Get("status"), limit)
+	machines, err := y.Find(ctx.Query("definitionId"), ctx.Query("status"), limit)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		ctx.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(machines)
+	ctx.JSON(http.StatusOK, machines)
 }
 
 // handleFire reads the machine id from the path, the event name from ?event=,
 // and any additional query params as the event payload.
 //
 //	POST /machines/order-42/event?event=PAYMENT_RECEIVED&amount=99.99
-func (y *Yggdrasil) handleFire(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	q := r.URL.Query()
+func (y *Yggdrasil) handleFire(ctx *draupnir.Context) {
+	id := ctx.Param("id")
+	q := ctx.Query("event")
 
-	event := q.Get("event")
-	if event == "" {
-		http.Error(w, "missing ?event= query parameter", http.StatusBadRequest)
+	if q == "" {
+		ctx.JSON(http.StatusBadRequest, map[string]string{"error": "missing ?event= query parameter"})
 		return
 	}
 
+	queryParams := ctx.Request.URL.Query()
+
 	// Every query param except "event" becomes payload data.
 	var payload map[string]any
-	for k, vals := range q {
+	for k, vals := range queryParams {
 		if k == "event" {
 			continue
 		}
@@ -369,19 +442,56 @@ func (y *Yggdrasil) handleFire(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	handled, err := y.FireWith(id, event, payload)
+	handled, err := y.FireWith(id, q, payload)
 	if err != nil {
 		if err == ErrInstanceNotFound {
-			http.Error(w, "machine not found", http.StatusNotFound)
+			ctx.JSON(http.StatusNotFound, map[string]string{"error": "machine not found"})
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		ctx.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 
 	if handled {
-		w.WriteHeader(http.StatusOK)
+		ctx.JSON(http.StatusOK, map[string]string{"message": fmt.Sprintf("Event %s sent successfully.", q)})
 	} else {
-		w.WriteHeader(http.StatusConflict)
+		possibleEvents, _ := y.AvailableEvents(id)
+		golog.Warn("Fired event '{}' was not accepted by machine '{}'. Possible events: {}", q, id, possibleEvents)
+		ctx.JSON(http.StatusConflict, map[string]string{"error": fmt.Sprintf("Event %s is not accepted by the state machine, possible events: %v", q, possibleEvents)})
 	}
+}
+
+func (y *Yggdrasil) handleResume(ctx *draupnir.Context) {
+	id := ctx.Param("id")
+
+	_, err := y.Resume(id)
+	if err != nil {
+		switch err {
+		case ErrInstanceNotFound:
+			ctx.JSON(http.StatusNotFound, map[string]string{"error": "machine not found"})
+		case ErrMachineTerminated:
+			ctx.JSON(http.StatusConflict, map[string]string{"error": "machine is in a terminal state and cannot be resumed"})
+		default:
+			ctx.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
+		return
+	}
+
+	ctx.JSON(http.StatusOK, map[string]string{"message": "Machine resumed."})
+}
+
+func (y *Yggdrasil) handleAvailableEvents(ctx *draupnir.Context) {
+	id := ctx.Param("id")
+
+	events, err := y.AvailableEvents(id)
+	if err != nil {
+		if err == ErrInstanceNotFound {
+			ctx.JSON(http.StatusNotFound, map[string]string{"error": "machine not found"})
+			return
+		}
+		ctx.JSON(http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, events)
 }

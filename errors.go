@@ -11,4 +11,7 @@ var (
 
 	// ErrDefinitionNotFound is returned when a workflow definition cannot be found
 	ErrDefinitionNotFound = errors.New("yggdrasil: workflow definition not found")
+
+	// ErrMachineTerminated is returned when attempting to resume a machine that is in a terminal state
+	ErrMachineTerminated = errors.New("yggdrasil: machine is in a terminal state and cannot be resumed")
 )
