@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/kashari/golog"
 	"github.com/kashari/yggdrasil/model"
 	"gorm.io/gorm"
 )
@@ -74,7 +74,7 @@ func Spawn(db *gorm.DB, instanceID uuid.UUID) *Machine {
 func (m *Machine) Loop() {
 	defer func() {
 		Machines.Delete(m.Instance.ID)
-		log.Printf("machine %s (%s) stopped", m.Instance.Name, m.Instance.ID)
+		golog.Info("machine {} ({}) stopped", m.Instance.Name, m.Instance.ID)
 	}()
 
 	for {
@@ -93,6 +93,7 @@ func (m *Machine) Loop() {
 			}
 
 		case <-m.stop:
+			golog.Info("machine {} ({}) received stop signal", m.Instance.Name, m.Instance.ID)
 			return
 		}
 	}
@@ -102,7 +103,7 @@ func (m *Machine) processEvent(evt Event) bool {
 	if m.Instance.Status == model.StatusWaiting {
 		isChildCallback := strings.HasPrefix(evt.Name, "CHILD_") || strings.HasPrefix(evt.Name, "SYS_")
 		if !isChildCallback {
-			log.Printf("ignored event %s on machine %s: waiting for child", evt.Name, m.Instance.ID)
+			golog.Info("ignored event {} on machine {}: waiting for child", evt.Name, m.Instance.ID)
 			return false
 		}
 	}
@@ -190,16 +191,16 @@ func (m *Machine) execStartChild(a model.ActionDefinition) {
 	}
 
 	if err := m.DB.Create(&childInst).Error; err != nil {
-		log.Printf("failed to create child machine: %v", err)
+		golog.Info("failed to create child machine: {}", err)
 		return
 	}
 
 	Spawn(m.DB, childInst.ID)
-	log.Printf("machine %s started child %s", m.Instance.ID, childInst.ID)
+	golog.Info("machine {} started child {}", m.Instance.ID, childInst.ID)
 
 	if a.Delegate {
 		m.Instance.Status = model.StatusWaiting
-		log.Printf("machine %s is now waiting for child", m.Instance.ID)
+		golog.Info("machine {} is now waiting for child", m.Instance.ID)
 	}
 }
 
@@ -212,7 +213,7 @@ func (m *Machine) notifyParent(parentID uuid.UUID) {
 	ack := make(chan bool)
 	parent.inbox <- Event{Name: "CHILD_COMPLETED", Ack: ack}
 	<-ack
-	log.Printf("child %s notified parent %s", m.Instance.ID, parentID)
+	golog.Info("child {} notified parent {}", m.Instance.ID, parentID)
 }
 
 func (m *Machine) execHttp(a model.ActionDefinition) {
@@ -226,14 +227,14 @@ func (m *Machine) execHttp(a model.ActionDefinition) {
 
 	req, err := http.NewRequest(a.Method, url, bytes.NewBufferString(a.Body))
 	if err != nil {
-		log.Printf("http action: failed to build request to %s: %v", url, err)
+		golog.Info("http action: failed to build request to {}: {}", url, err)
 		return
 	}
 
 	client := &http.Client{Timeout: HTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("http action: request to %s failed: %v", url, err)
+		golog.Info("http action: request to {} failed: {}", url, err)
 		return
 	}
 	resp.Body.Close()
